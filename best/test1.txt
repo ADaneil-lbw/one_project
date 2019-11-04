@@ -1,0 +1,206 @@
+#include "nrf2401.h"
+#include "display.h"
+
+const u8 TX_ADDRESS[TX_ADR_WIDTH]={0x11,0x22,0x33,0x44,0x55}; //发送地址
+const u8 RX_ADDRESS[RX_ADR_WIDTH]={0x11,0x22,0x33,0x44,0x55}; //接收地址
+
+u8 xdata RxBuf[32];
+u8 xdata TxBuf[32];
+
+u8 NRF_MODE = 0;//初始化为接受模式
+
+/*******************************延时函数******/
+void inerDelay_us(unsigned char n)
+{
+	for(;n>0;n--)
+	_nop_();
+}
+
+/****************************************************************************************************
+/*函数：uint SPI_RW(uintuchar)
+/*功能：NRF24L01的SPI 写时序
+/****************************************************************************************************/
+u16 SPI_RW(u16 uchar)
+{
+	u16 bit_ctr;
+	for(bit_ctr=0;bit_ctr<8;bit_ctr++) // output 8-bit
+	{
+		MOSI = (uchar& 0x80); // output 'uchar', MSB to MOSI
+		uchar = (uchar<< 1); // shift next bit into MSB..
+		SCK = 1; // Set SCK high..
+		uchar |= MISO; // capture current MISO bit
+		SCK = 0; // ..then set SCK low again
+	}
+	return(uchar); // return read uchar
+}
+
+/****************************************************************************************************
+/*函数：ucharSPI_Read(ucharreg)
+/*功能：NRF24L01的SPI 时序
+/****************************************************************************************************/
+u8 SPI_Read(u8 reg)
+{
+	u8 reg_val;
+	CSN = 0; // CSN low, initialize SPI communication...
+	SPI_RW(reg); // Select register to read from..
+	reg_val = SPI_RW(0); // ..then read registervalue
+	CSN = 1; // CSN high, terminate SPI communication
+	return(reg_val); // return register value
+}
+/****************************************************************************************************/
+/*功能：NRF24L01读写寄存器函数
+/****************************************************************************************************/
+u16 SPI_RW_Reg(u8 reg, u8 value)
+{
+	u16 status;
+	CSN = 0; // CSN low, init SPI transaction
+	status = SPI_RW(reg); // select register
+	SPI_RW(value); // ..and write value to it..
+	CSN = 1; // CSN high again
+	return(status); // return nRF24L01 status uchar
+}
+
+/****************************************************************************************************/
+/*函数：uintSPI_Read_Buf(ucharreg, uchar *pBuf, ucharuchars)
+/*功能: 用于读数据，reg ：为寄存器地址，pBuf ：为待读出数据地址，uchars ：读出数据的个数
+/****************************************************************************************************/
+u16 SPI_Read_Buf(u8 reg, u8 *pBuf, u8 uchars)
+{
+	u16 status,uchar_ctr;
+	CSN = 0; // Set CSN low, init SPI tranaction
+	status = SPI_RW(reg); // Select register to write to and read status uchar
+	for(uchar_ctr=0;uchar_ctr<uchars;uchar_ctr++)
+	pBuf[uchar_ctr] = SPI_RW(0); //
+	CSN = 1;
+	return(status); // return nRF24L01 status uchar
+}
+
+/*********************************************************************************************************
+/*函数：uintSPI_Write_Buf(ucharreg, uchar *pBuf, ucharuchars)
+/*功能: 用于写数据：为寄存器地址，pBuf ：为待写入数据地址，uchars ：写入数据的个数 /*********************************************************************************************************/
+u16 SPI_Write_Buf(u8 reg, u8 *pBuf, u8 uchars)
+{
+	u16 status,uchar_ctr;
+	CSN = 0; //SPI使能
+	status = SPI_RW(reg);
+	for(uchar_ctr=0; uchar_ctr<uchars; uchar_ctr++) //
+	SPI_RW(*pBuf++);
+	CSN = 1; //关闭SPI
+	return(status); //
+}
+
+void NRF24L01_Init(void)
+{
+		CE = 0;
+		CSN = 1;
+		SCK=0;
+}
+
+//检测24L01是否存在
+//返回值:0，成功;1，失败	
+u8 NRF24L01_Check(void)
+{
+		u8 buf[5] = {0XA5,0XA5,0XA5,0XA5,0XA5};
+		u8 i;
+		SPI_Write_Buf(NRF_WRITE_REG+TX_ADDR,buf,5);
+		SPI_Read_Buf(TX_ADDR,buf,5);
+		for(i=0;i<5;i++)if(buf[i]!=0XA5)break;
+		if(i!=5)return 1;//检测24L01错误
+		return 0;		 //检测到24L01
+}
+
+//启动NRF24L01发送一次数据
+//txbuf:待发送数据首地址
+//返回值:发送完成状况
+u8 NRF24L01_TxPacket(u8 *txbuf)
+{
+		u8 sta;
+		CE = 0;
+		SPI_Write_Buf(WR_TX_PLOAD,txbuf,TX_PLOAD_WIDTH);//写数据到TX BUF  32个字节
+		CE = 1;
+		inerDelay_us(130);
+		while(IRQ != 0);  //等待发送完成
+		sta = SPI_Read(STATUS);//读取状态寄存器的值	   
+		SPI_RW_Reg(NRF_WRITE_REG+STATUS,sta);//清除TX_DS或MAX_RT中断标志
+		if(sta&MAX_TX)//达到最大重发次数
+		{
+			SPI_RW_Reg(FLUSH_TX,0xff);//清除TX FIFO寄存器 
+			return MAX_TX; 
+		}
+		if(sta&TX_OK)//发送完成
+		{
+			return TX_OK;
+		}
+		return 0xff;//其他原因发送失败
+}
+//启动NRF24L01发送一次数据
+//txbuf:待发送数据首地址
+//返回值:0，接收完成；其他，错误代码
+u8 NRF24L01_RxPacket(u8 *rxbuf)
+{
+		u8 sta;	
+	  static u8 t=0;
+	  while(IRQ!=0)
+		{	
+			t++;
+			inerDelay_us(1000000);
+//      dspbuf[2] = 3;//发送失败
+//			dspbuf[3] = 1;
+			inerDelay_us(1000000);
+			if(t >= 10)
+			{
+				t =0;
+//       dspbuf[2] = 4;//发送失败
+//				dspbuf[3] = 2;
+				sta=SPI_Read(STATUS);  //读取状态寄存器的值    	 
+		    SPI_RW_Reg(NRF_WRITE_REG+STATUS,sta); //清除TX_DS或MAX_RT中断标志
+				return 1;
+			}
+		}
+		sta=SPI_Read(STATUS);  //读取状态寄存器的值    	 
+		SPI_RW_Reg(NRF_WRITE_REG+STATUS,sta); //清除TX_DS或MAX_RT中断标志
+		if(sta&RX_OK)//接收到数据
+		{
+			SPI_Read_Buf(RD_RX_PLOAD,rxbuf,RX_PLOAD_WIDTH);//读取数据
+			SPI_RW_Reg(FLUSH_RX,0xff);//清除RX FIFO寄存器 
+			return 0; 
+		}	
+		return 1;//没收到任何数据
+}
+//该函数初始化NRF24L01到RX模式
+//设置RX地址,写RX数据宽度,选择RF频道,波特率和LNA HCURR
+//当CE变高后,即进入RX模式,并可以接收数据了		
+void NRF24L01_RX_Mode(void)
+{
+		CE = 0;
+		SPI_Write_Buf(NRF_WRITE_REG+RX_ADDR_P0,(u8*)RX_ADDRESS,RX_ADR_WIDTH);//写RX节点地址
+	  
+		SPI_RW_Reg(NRF_WRITE_REG+EN_AA,0x01);    //使能通道0的自动应答    
+		SPI_RW_Reg(NRF_WRITE_REG+EN_RXADDR,0x01);//使能通道0的接收地址  	 
+		SPI_RW_Reg(NRF_WRITE_REG+RF_CH,40);	     //设置RF通信频率		  
+		SPI_RW_Reg(NRF_WRITE_REG+RX_PW_P0,RX_PLOAD_WIDTH);//选择通道0的有效数据宽度 	    
+		SPI_RW_Reg(NRF_WRITE_REG+RF_SETUP,0x0f);//设置TX发射参数,0db增益,2Mbps,低噪声增益开启   
+		SPI_RW_Reg(NRF_WRITE_REG+CONFIG, 0x0f);//配置基本工作模式的参数;PWR_UP,EN_CRC,16BIT_CRC,接收模式 
+		CE = 1;//CE为高,进入接收模式 
+		inerDelay_us(130);
+}
+//该函数初始化NRF24L01到TX模式
+//设置TX地址,写TX数据宽度,设置RX自动应答的地址,填充TX发送数据,选择RF频道,波特率和LNA HCURR
+//PWR_UP,CRC使能
+//当CE变高后,即进入RX模式,并可以接收数据了		   
+//CE为高大于10us,则启动发送.	 
+void NRF24L01_TX_Mode(void)
+{
+		CE = 0;
+		SPI_Write_Buf(NRF_WRITE_REG+TX_ADDR,(u8*)TX_ADDRESS,TX_ADR_WIDTH);//写TX节点地址 
+		SPI_Write_Buf(NRF_WRITE_REG+RX_ADDR_P0,(u8*)RX_ADDRESS,RX_ADR_WIDTH); //设置TX节点地址,主要为了使能ACK	  
+
+		SPI_RW_Reg(NRF_WRITE_REG+EN_AA,0x01);     //使能通道0的自动应答    
+		SPI_RW_Reg(NRF_WRITE_REG+EN_RXADDR,0x01); //使能通道0的接收地址  
+		SPI_RW_Reg(NRF_WRITE_REG+SETUP_RETR,0x1a);//设置自动重发间隔时间:500us + 86us;最大自动重发次数:10次
+		SPI_RW_Reg(NRF_WRITE_REG+RF_CH,40);       //设置RF通道为40
+		SPI_RW_Reg(NRF_WRITE_REG+RF_SETUP,0x0f);  //设置TX发射参数,0db增益,2Mbps,低噪声增益开启   
+		SPI_RW_Reg(NRF_WRITE_REG+CONFIG,0x0e);    //配置基本工作模式的参数;PWR_UP,EN_CRC,16BIT_CRC,接收模式,开启所有中断
+		CE = 1;
+		inerDelay_us(130);
+}
